@@ -79,6 +79,9 @@
 #include "http_proxy.h"
 #include "socks.h"
 
+#include <ifaddrs.h>
+#include <netinet/in.h>
+
 /* The last 3 #include files should be in this order */
 #include "curl_printf.h"
 #include "curl_memory.h"
@@ -810,6 +813,72 @@ evaluate:
   return result;
 }
 
+
+static void check_interfaces(struct Curl_cfilter *cf,
+                             struct Curl_easy *data,
+                             bool *seen_ipv4, bool *seen_ipv6)
+{
+  struct ifaddrs *ifa = NULL;
+  struct ifaddrs *runp;
+  struct sockaddr_in *sa;
+  struct sockaddr_in6 *sa6;
+  sa_family_t family;
+
+  CURL_TRC_CF(data, cf, "check_interfaces() called");
+
+  /* Get the interface list */
+  if(getifaddrs (&ifa) != 0) {
+    CURL_TRC_CF(data, cf, "cannot determine interfaces");
+    /* We cannot determine what interfaces are available.  Be pessimistic.  */
+    *seen_ipv4 = true;
+    *seen_ipv6 = true;
+    return;
+  }
+
+  *seen_ipv4 = false;
+  *seen_ipv6 = false;
+
+  for(runp = ifa; runp != NULL; runp = runp->ifa_next) {
+    CURL_TRC_CF(data, cf, "checking interface %s",
+                runp->ifa_name);
+    if(runp->ifa_addr) {
+      family = runp->ifa_addr->sa_family;
+      CURL_TRC_CF(data, cf, "address family: %i", family);
+
+      if(family == AF_INET6) {
+        CURL_TRC_CF(data, cf, "have v6");
+        sa6 = (struct sockaddr_in6 *) runp->ifa_addr;
+      }
+      else if(family == AF_INET) {
+        CURL_TRC_CF(data, cf, "have v4");
+        sa = (struct sockaddr_in *) runp->ifa_addr;
+      }
+
+      if(sa6) {
+        *seen_ipv6 = true;
+      }
+      else if(sa) {
+        *seen_ipv4 = true;
+      }
+
+      /*
+      if(*seen_ipv4 && *seen_ipv6) {
+        return;
+      }
+      */
+
+    }
+    else {
+      CURL_TRC_CF(data, cf, "does not have address");
+    }
+  }
+
+  CURL_TRC_CF(data, cf, "v4: %i, v6: %i", seen_ipv4, seen_ipv6);
+
+  (void) freeifaddrs(ifa);
+}
+
+
 /*
  * Connect to the given host with timeout, proxy or remote does not matter.
  * There might be more than one IP address to try out.
@@ -824,6 +893,9 @@ static CURLcode start_connect(struct Curl_cfilter *cf,
   int ai_family0, ai_family1;
   timediff_t timeout_ms = Curl_timeleft(data, NULL, TRUE);
   const struct Curl_addrinfo *addr0, *addr1;
+
+  bool have_ipv4 = false;
+  bool have_ipv6 = false;
 
   if(timeout_ms < 0) {
     /* a precaution, no need to continue if time already is up */
@@ -842,7 +914,14 @@ static CURLcode start_connect(struct Curl_cfilter *cf,
    * the 2 connect attempt ballers to try different families, if possible.
    *
    */
-  if(conn->ip_version == CURL_IPRESOLVE_WHATEVER) {
+  check_interfaces(cf, data, &have_ipv4, &have_ipv6);
+  CURL_TRC_CF(data, cf, "v4: %i, v6: %i", have_ipv4, have_ipv6);
+  if(have_ipv6 && !have_ipv4) {
+    CURL_TRC_CF(data, cf, "system specified IP version - IPv6");
+    ai_family0 = AF_INET6;
+  }
+  else if(conn->ip_version == CURL_IPRESOLVE_WHATEVER) {
+    CURL_TRC_CF(data, cf, "any IP version");
     /* any IP version is allowed */
     ai_family0 = remotehost->addr?
       remotehost->addr->ai_family : 0;
@@ -854,6 +933,7 @@ static CURLcode start_connect(struct Curl_cfilter *cf,
 #endif
   }
   else {
+    CURL_TRC_CF(data, cf, "user specified IP version");
     /* only one IP version is allowed */
     ai_family0 = (conn->ip_version == CURL_IPRESOLVE_V4) ?
       AF_INET :
